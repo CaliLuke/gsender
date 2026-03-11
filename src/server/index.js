@@ -43,7 +43,7 @@ import webappengine from 'webappengine';
 
 import settings from './config/settings';
 import app from './app';
-import cncengine from './services/cncengine';
+import machineCore from './services/machine-core';
 import monitor from './services/monitor';
 import config from './services/configstore';
 import { ensureString } from './lib/ensure-type';
@@ -272,7 +272,7 @@ const createServer = (options, callback) => {
     webappengine({ port, host, backlog, routes })
         .on('ready', (server) => {
             // cncengine service
-            cncengine.start(server, options.controller || config.get('controller', ''));
+            machineCore.start(server, options.controller || config.get('controller', ''));
 
             const address = server.address().address;
             const port = server.address().port;

@@ -47,6 +47,12 @@ test('send-response streaming protocol', (t) => {
         timePaused: sender.state.timePaused,
         timeRunning: sender.state.timeRunning,
         toolChanges: 0,
+        bufferSize: null,
+        dataLength: null,
+        estimatedTime: 0,
+        ovF: 100,
+        isRotaryFile: false,
+        currentLineRunning: 0,
     });
 
     sender.on('data', () => {
@@ -72,6 +78,12 @@ test('send-response streaming protocol', (t) => {
             timePaused: sender.state.timePaused,
             timeRunning: sender.state.timeRunning,
             toolChanges: 0,
+            bufferSize: null,
+            dataLength: null,
+            estimatedTime: 0,
+            ovF: 100,
+            isRotaryFile: false,
+            currentLineRunning: 0,
         });
 
         sender.unload();
@@ -94,6 +106,15 @@ test('send-response streaming protocol', (t) => {
             timePaused: 0,
             timeRunning: 0,
             toolChanges: 0,
+            estimatedTime: 0,
+            estimateData: [],
+            ovF: 100,
+            countdownQueue: [],
+            totalSentToQueue: 0,
+            queueDone: true,
+            timer: 0,
+            countdownIsPaused: false,
+            isRotaryFile: false,
         });
         t.same(sender.toJSON(), {
             sp: SP_TYPE_SEND_RESPONSE,
@@ -112,6 +133,12 @@ test('send-response streaming protocol', (t) => {
             timePaused: 0,
             timeRunning: 0,
             toolChanges: 0,
+            bufferSize: null,
+            dataLength: null,
+            estimatedTime: 0,
+            ovF: 100,
+            isRotaryFile: false,
+            currentLineRunning: 0,
         });
 
         t.end();
@@ -187,6 +214,12 @@ test('character-counting streaming protocol', (t) => {
         timePaused: sender.state.timePaused,
         timeRunning: sender.state.timeRunning,
         toolChanges: 0,
+        bufferSize: null,
+        dataLength: null,
+        estimatedTime: 0,
+        ovF: 100,
+        isRotaryFile: false,
+        currentLineRunning: 0,
     });
 
     sender.on('data', () => {
@@ -212,6 +245,12 @@ test('character-counting streaming protocol', (t) => {
             timePaused: sender.state.timePaused,
             timeRunning: sender.state.timeRunning,
             toolChanges: 0,
+            bufferSize: null,
+            dataLength: null,
+            estimatedTime: 0,
+            ovF: 100,
+            isRotaryFile: false,
+            currentLineRunning: 0,
         });
 
         sender.unload();
@@ -234,6 +273,15 @@ test('character-counting streaming protocol', (t) => {
             timePaused: 0,
             timeRunning: 0,
             toolChanges: 0,
+            estimatedTime: 0,
+            estimateData: [],
+            ovF: 100,
+            countdownQueue: [],
+            totalSentToQueue: 0,
+            queueDone: true,
+            timer: 0,
+            countdownIsPaused: false,
+            isRotaryFile: false,
         });
         t.same(sender.toJSON(), {
             sp: SP_TYPE_CHAR_COUNTING,
@@ -252,6 +300,12 @@ test('character-counting streaming protocol', (t) => {
             timePaused: 0,
             timeRunning: 0,
             toolChanges: 0,
+            bufferSize: null,
+            dataLength: null,
+            estimatedTime: 0,
+            ovF: 100,
+            isRotaryFile: false,
+            currentLineRunning: 0,
         });
 
         t.end();

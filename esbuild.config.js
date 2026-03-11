@@ -175,7 +175,7 @@ function prebuild(target) {
 
     // Clean
     fs.rmSync(isDev ? path.join(__dirname, 'output') : path.join(__dirname, 'dist'),
-              { recursive: true, force: true });
+        { recursive: true, force: true });
 
     // Create output dirs
     fs.mkdirSync(baseDir, { recursive: true });

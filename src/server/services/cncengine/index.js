@@ -41,9 +41,14 @@ const unload = () => {
     cncengine.unload();
 };
 
+const listDevices = () => {
+    return cncengine.listDevices();
+};
+
 export default {
     start,
     stop,
     load,
-    unload
+    unload,
+    listDevices,
 };

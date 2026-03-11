@@ -1,0 +1,369 @@
+// Code generated with goa v3.25.3, DO NOT EDIT.
+//
+// machine protocol buffer definition
+//
+// Command:
+// $ goa gen github.com/Sienci-Labs/gsender/machine-core/design
+
+syntax = "proto3";
+
+package machine;
+
+option go_package = "/machinepb";
+import "google/protobuf/struct.proto";
+
+// Machine session lifecycle and runtime control.
+service Machine {
+	// List discoverable machine-capable devices.
+	rpc ListDevices (ListDevicesRequest) returns (ListDevicesResponse);
+	// Open a device and create a machine session.
+	rpc OpenSession (OpenSessionRequest) returns (OpenSessionResponse);
+	// Close and destroy a machine session.
+	rpc CloseSession (CloseSessionRequest) returns (CloseSessionResponse);
+	// Get session metadata.
+	rpc GetSession (GetSessionRequest) returns (GetSessionResponse);
+	// Get full session snapshot suitable for reconnect or replay.
+	rpc GetSnapshot (GetSnapshotRequest) returns (GetSnapshotResponse);
+	// Resolve the active session for a device, attach the client, and return a
+// replay-safe snapshot.
+	rpc ResolveSession (ResolveSessionRequest) returns (ResolveSessionResponse);
+	// Attach a logical client to a session and return a replay-safe snapshot.
+	rpc AttachClient (AttachClientRequest) returns (AttachClientResponse);
+	// Detach a logical client from a session.
+	rpc DetachClient (DetachClientRequest) returns (DetachClientResponse);
+	// Submit a structured machine command.
+	rpc SendCommand (SendCommandRequest) returns (SendCommandResponse);
+	// Load G-code into the session runtime.
+	rpc LoadFile (LoadFileRequest) returns (LoadFileResponse);
+	// Unload the active file from the session.
+	rpc UnloadFile (UnloadFileRequest) returns (UnloadFileResponse);
+	// Start executing the loaded file.
+	rpc StartJob (StartJobRequest) returns (StartJobResponse);
+	// Pause the active job.
+	rpc PauseJob (PauseJobRequest) returns (PauseJobResponse);
+	// Resume a paused job.
+	rpc ResumeJob (ResumeJobRequest) returns (ResumeJobResponse);
+	// Stop the active job.
+	rpc StopJob (StopJobRequest) returns (StopJobResponse);
+	// Flash firmware to a machine device.
+	rpc FlashFirmware (FlashFirmwareRequest) returns (FlashFirmwareResponse);
+	// Stream runtime events for one session.
+	rpc SubscribeEvents (SubscribeEventsRequest) returns (stream SubscribeEventsResponse);
+}
+
+message ListDevicesRequest {
+}
+
+message ListDevicesResponse {
+	repeated Device field = 1;
+}
+// A discoverable machine-capable device.
+message Device {
+	// Stable device identifier.
+	string id = 1;
+	// Device kind.
+	string kind = 2;
+	// Serial path when applicable.
+	optional string path = 3;
+	// Network address when applicable.
+	optional string network_address = 4;
+	optional string manufacturer = 5;
+	optional string vendor_id = 6;
+	optional string product_id = 7;
+	optional string serial_number = 8;
+	string display_name = 9;
+	bool in_use = 10;
+	repeated string capabilities = 11;
+}
+
+message OpenSessionRequest {
+	string device_id = 1;
+	optional sint32 baud_rate = 2;
+	optional bool rtscts = 3;
+	optional sint32 network_port = 4;
+	optional string default_firmware = 5;
+	optional string client_id = 6;
+}
+
+message OpenSessionResponse {
+	Session session = 1;
+	SessionSnapshot snapshot = 2;
+}
+// One active machine session.
+message Session {
+	string id = 1;
+	string device_id = 2;
+	string controller_type = 3;
+	string connection_state = 4;
+	string workflow_state = 5;
+	// RFC3339 timestamp.
+	optional string created_at = 6;
+	// RFC3339 timestamp.
+	optional string updated_at = 7;
+}
+// Full reconnect-safe view of a machine session.
+message SessionSnapshot {
+	Session session = 1;
+	// Controller runtime state.
+	optional google.protobuf.Value controller_state = 2;
+	// Controller configuration/settings.
+	optional google.protobuf.Value controller_settings = 3;
+	// Sender/job streamer status.
+	optional google.protobuf.Value sender_status = 4;
+	// Feeder/queue status.
+	optional google.protobuf.Value feeder_status = 5;
+	LoadedFile loaded_file = 6;
+	HomingState homing_state = 7;
+	// Current alarm information.
+	optional google.protobuf.Value alarm_state = 8;
+	RuntimeFlags runtime_flags = 9;
+	optional string last_error = 10;
+}
+// Metadata for the active file loaded into a session.
+message LoadedFile {
+	string name = 1;
+	sint64 size_bytes = 2;
+	optional sint64 line_count = 3;
+	optional string checksum = 4;
+	// RFC3339 timestamp.
+	optional string loaded_at = 5;
+}
+// Homing-related runtime state.
+message HomingState {
+	bool homing_required = 1;
+	bool has_homed = 2;
+	// RFC3339 timestamp.
+	optional string last_homing_at = 3;
+}
+// Derived capability flags for the current session state.
+message RuntimeFlags {
+	bool can_start_job = 1;
+	bool can_pause_job = 2;
+	bool can_resume_job = 3;
+	bool can_stop_job = 4;
+	bool can_unload_file = 5;
+	bool can_flash_firmware = 6;
+}
+
+message CloseSessionRequest {
+	string session_id = 1;
+}
+
+message CloseSessionResponse {
+	bool ok = 1;
+}
+
+message GetSessionRequest {
+	string session_id = 1;
+}
+
+message GetSessionResponse {
+	string id = 1;
+	string device_id = 2;
+	string controller_type = 3;
+	string connection_state = 4;
+	string workflow_state = 5;
+	// RFC3339 timestamp.
+	optional string created_at = 6;
+	// RFC3339 timestamp.
+	optional string updated_at = 7;
+}
+
+message GetSnapshotRequest {
+	string session_id = 1;
+}
+
+message GetSnapshotResponse {
+	Session session = 1;
+	// Controller runtime state.
+	optional google.protobuf.Value controller_state = 2;
+	// Controller configuration/settings.
+	optional google.protobuf.Value controller_settings = 3;
+	// Sender/job streamer status.
+	optional google.protobuf.Value sender_status = 4;
+	// Feeder/queue status.
+	optional google.protobuf.Value feeder_status = 5;
+	LoadedFile loaded_file = 6;
+	HomingState homing_state = 7;
+	// Current alarm information.
+	optional google.protobuf.Value alarm_state = 8;
+	RuntimeFlags runtime_flags = 9;
+	optional string last_error = 10;
+}
+
+message ResolveSessionRequest {
+	string device_id = 1;
+	string client_id = 2;
+}
+
+message ResolveSessionResponse {
+	Session session = 1;
+	// Controller runtime state.
+	optional google.protobuf.Value controller_state = 2;
+	// Controller configuration/settings.
+	optional google.protobuf.Value controller_settings = 3;
+	// Sender/job streamer status.
+	optional google.protobuf.Value sender_status = 4;
+	// Feeder/queue status.
+	optional google.protobuf.Value feeder_status = 5;
+	LoadedFile loaded_file = 6;
+	HomingState homing_state = 7;
+	// Current alarm information.
+	optional google.protobuf.Value alarm_state = 8;
+	RuntimeFlags runtime_flags = 9;
+	optional string last_error = 10;
+}
+
+message AttachClientRequest {
+	string session_id = 1;
+	string client_id = 2;
+}
+
+message AttachClientResponse {
+	Session session = 1;
+	// Controller runtime state.
+	optional google.protobuf.Value controller_state = 2;
+	// Controller configuration/settings.
+	optional google.protobuf.Value controller_settings = 3;
+	// Sender/job streamer status.
+	optional google.protobuf.Value sender_status = 4;
+	// Feeder/queue status.
+	optional google.protobuf.Value feeder_status = 5;
+	LoadedFile loaded_file = 6;
+	HomingState homing_state = 7;
+	// Current alarm information.
+	optional google.protobuf.Value alarm_state = 8;
+	RuntimeFlags runtime_flags = 9;
+	optional string last_error = 10;
+}
+
+message DetachClientRequest {
+	string session_id = 1;
+	string client_id = 2;
+}
+
+message DetachClientResponse {
+	bool ok = 1;
+}
+
+message SendCommandRequest {
+	string session_id = 1;
+	MachineCommand command = 2;
+}
+// Structured command sent to a machine session.
+message MachineCommand {
+	string type = 1;
+	optional string raw_line = 2;
+	AxisMove axis_move = 3;
+	optional sint32 feed_override = 4;
+	optional sint32 spindle_override = 5;
+	optional sint32 rapid_override = 6;
+	map<string, string> metadata = 7;
+}
+// Jog or axis move request.
+message AxisMove {
+	optional double x = 1;
+	optional double y = 2;
+	optional double z = 3;
+	optional double a = 4;
+	optional double feed_rate = 5;
+}
+
+message SendCommandResponse {
+	bool accepted = 1;
+}
+
+message LoadFileRequest {
+	string session_id = 1;
+	string name = 2;
+	string content = 3;
+	optional string content_type = 4;
+	map<string, string> metadata = 5;
+}
+
+message LoadFileResponse {
+	Session session = 1;
+	// Controller runtime state.
+	optional google.protobuf.Value controller_state = 2;
+	// Controller configuration/settings.
+	optional google.protobuf.Value controller_settings = 3;
+	// Sender/job streamer status.
+	optional google.protobuf.Value sender_status = 4;
+	// Feeder/queue status.
+	optional google.protobuf.Value feeder_status = 5;
+	LoadedFile loaded_file = 6;
+	HomingState homing_state = 7;
+	// Current alarm information.
+	optional google.protobuf.Value alarm_state = 8;
+	RuntimeFlags runtime_flags = 9;
+	optional string last_error = 10;
+}
+
+message UnloadFileRequest {
+	string session_id = 1;
+}
+
+message UnloadFileResponse {
+	bool ok = 1;
+}
+
+message StartJobRequest {
+	string session_id = 1;
+}
+
+message StartJobResponse {
+	bool accepted = 1;
+}
+
+message PauseJobRequest {
+	string session_id = 1;
+}
+
+message PauseJobResponse {
+	bool accepted = 1;
+}
+
+message ResumeJobRequest {
+	string session_id = 1;
+}
+
+message ResumeJobResponse {
+	bool accepted = 1;
+}
+
+message StopJobRequest {
+	string session_id = 1;
+	optional bool force = 2;
+}
+
+message StopJobResponse {
+	bool accepted = 1;
+}
+
+message FlashFirmwareRequest {
+	string device_id = 1;
+	// Image identifier or artifact reference.
+	string image = 2;
+	// Inline payload when needed.
+	optional string hex = 3;
+	optional string controller_type = 4;
+}
+
+message FlashFirmwareResponse {
+	bool accepted = 1;
+}
+
+message SubscribeEventsRequest {
+	string session_id = 1;
+	string client_id = 2;
+}
+
+message SubscribeEventsResponse {
+	string session_id = 1;
+	sint64 sequence = 2;
+	// RFC3339 timestamp.
+	string occurred_at = 3;
+	string type = 4;
+	// Event-specific payload.
+	optional google.protobuf.Value payload = 5;
+}

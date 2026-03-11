@@ -21,7 +21,7 @@
  *
  */
 
-import CNCEngine from '../services/cncengine';
+import machineCore from '../services/machine-core';
 import { ERR_BAD_REQUEST } from '../constants';
 
 // Upload files using superagent:
@@ -39,7 +39,7 @@ export const uploadFile = (req, res) => {
     const { buffer } = file;
     const gcode = buffer.toString();
 
-    CNCEngine.load({
+    machineCore.load({
         gcode,
         port,
         name: file.originalname,

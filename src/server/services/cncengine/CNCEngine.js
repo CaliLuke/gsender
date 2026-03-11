@@ -23,7 +23,6 @@
 
 import ensureArray from 'ensure-array';
 import noop from 'lodash/noop';
-import partition from 'lodash/partition';
 import { SerialPort } from 'serialport';
 import socketIO from 'socket.io';
 import { app } from 'electron';
@@ -34,6 +33,13 @@ import logger from '../../lib/logger';
 import store from '../../store';
 import config from '../configstore';
 import taskRunner from '../taskrunner';
+import { buildMachineCoreDeviceList, partitionDevicesForLegacySocket } from '../machine-core/devices';
+import {
+    shouldUseGoMachineCorePath,
+    extractSessionID,
+    relayMachineSessionSnapshot,
+    relayMachineSessionEvent,
+} from '../machine-core/sidecar';
 import FlashingFirmware from '../../lib/Firmware/Flashing/firmwareflashing';
 import {
     GrblController,
@@ -57,14 +63,6 @@ const caseInsensitiveEquals = (str1, str2) => {
     str1 = str1 ? (str1 + '').toUpperCase() : '';
     str2 = str2 ? (str2 + '').toUpperCase() : '';
     return str1 === str2;
-};
-
-// Case insensitive includes.
-// @param {array} arr Array to check.
-// @param {string} val Value to check for in the array.
-// @return {boolean} True if val is in arr, ignoring case.
-const caseInsensitiveIncludes = (arr, val) => {
-    return arr.some((arrVal) => caseInsensitiveEquals(arrVal, val));
 };
 
 const isValidController = (controller) => (
@@ -115,6 +113,10 @@ class CNCEngine {
 
     networkDevices = [];
 
+    machineCoreSessions = new Map();
+
+    machineCoreRequestCounter = 0;
+
     // Event Trigger
     event = new EventTrigger((event, trigger, commands) => {
         log.debug(`EventTrigger: event="${event}", trigger="${trigger}", commands="${commands}"`);
@@ -122,6 +124,473 @@ class CNCEngine {
             taskRunner.run(commands);
         }
     });
+
+    async listDevices() {
+        const serialPorts = await SerialPort.list();
+        const configuredPorts = ensureArray(config.get('ports', []));
+        const controllers = store.get('controllers', {});
+
+        return buildMachineCoreDeviceList({
+            serialPorts: serialPorts.concat(configuredPorts),
+            controllers,
+            networkDevices: this.networkDevices,
+        });
+    }
+
+    async listSocketDevices() {
+        if (!shouldUseGoMachineCorePath('device_list')) {
+            return this.listDevices();
+        }
+
+        const startedAt = Date.now();
+        try {
+            // eslint-disable-next-line global-require
+            const machineCore = require('../machine-core').default;
+            const devices = await machineCore.listDevices();
+            log.info(`machine-core handled device list via Go sidecar in ${Date.now() - startedAt}ms`);
+            return devices;
+        } catch (error) {
+            log.warn(`machine-core sidecar listDevices failed after ${Date.now() - startedAt}ms: ${error.message}`);
+            return this.listDevices();
+        }
+    }
+
+    nextMachineCoreRequestID(prefix = 'machine-core') {
+        this.machineCoreRequestCounter += 1;
+        return `${prefix}-${Date.now()}-${this.machineCoreRequestCounter}`;
+    }
+
+    buildMachineCoreRPCContext({
+        action,
+        port,
+        socketId = null,
+        sessionId = null,
+        commandType = null,
+        controllerEvent = null,
+        origin = 'node-cncengine',
+    } = {}) {
+        return {
+            request_id: this.nextMachineCoreRequestID(action || 'machine-core'),
+            action,
+            port,
+            socket_id: socketId || undefined,
+            session_id: sessionId || undefined,
+            command_type: commandType || undefined,
+            controller_event: controllerEvent || undefined,
+            origin,
+        };
+    }
+
+    async syncMachineCoreSessionOpen(port, options = {}, socket) {
+        if (!shouldUseGoMachineCorePath('session_open')) {
+            return null;
+        }
+
+        const existingSessionId = this.machineCoreSessions.get(port);
+        if (existingSessionId) {
+            return existingSessionId;
+        }
+
+        const startedAt = Date.now();
+        // eslint-disable-next-line global-require
+        const machineCore = require('../machine-core').default;
+        const result = await machineCore.openSession({
+            device_id: port,
+            baud_rate: options.baudrate,
+            rtscts: options.rtscts,
+            network_port: options.ethernetPort || options.networkPort,
+            default_firmware: options.defaultFirmware,
+            client_id: socket?.id,
+        }, this.buildMachineCoreRPCContext({
+            action: 'session_open',
+            port,
+            socketId: socket?.id,
+        }));
+        const sessionId = extractSessionID(result);
+        if (!sessionId) {
+            throw new Error(`machine-core openSession returned no session for ${port}`);
+        }
+        this.machineCoreSessions.set(port, sessionId);
+        log.info(`machine-core handled session open for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+        return sessionId;
+    }
+
+    async syncMachineCoreSessionAttach(port, socket) {
+        if (!shouldUseGoMachineCorePath('session_attach')) {
+            return false;
+        }
+
+        const startedAt = Date.now();
+        try {
+            // eslint-disable-next-line global-require
+            const machineCore = require('../machine-core').default;
+            const snapshot = await machineCore.resolveSession(port, socket.id, this.buildMachineCoreRPCContext({
+                action: 'session_attach',
+                port,
+                socketId: socket?.id,
+            }));
+            const sessionId = snapshot?.session?.id;
+            if (!sessionId) {
+                return false;
+            }
+            this.machineCoreSessions.set(port, sessionId);
+            let replayCount = 0;
+            relayMachineSessionSnapshot(socket, snapshot, this);
+            await machineCore.replayEvents(sessionId, socket.id, (event) => {
+                replayCount += 1;
+                relayMachineSessionEvent(socket, event, this);
+            }, this.buildMachineCoreRPCContext({
+                action: 'session_replay',
+                port,
+                socketId: socket?.id,
+                sessionId,
+            }));
+            log.info(`machine-core handled session attach for ${port} via Go sidecar in ${Date.now() - startedAt}ms with ${replayCount} replay events`);
+            return true;
+        } catch (error) {
+            log.warn(`machine-core sidecar attach failed for ${port} after ${Date.now() - startedAt}ms: ${error.message}`);
+            return false;
+        }
+    }
+
+    async syncMachineCoreSessionClose(port, socketId = null) {
+        if (!shouldUseGoMachineCorePath('session_close')) {
+            return false;
+        }
+
+        const sessionId = this.machineCoreSessions.get(port);
+        if (!sessionId) {
+            return false;
+        }
+
+        this.machineCoreSessions.delete(port);
+
+        const startedAt = Date.now();
+        try {
+            // eslint-disable-next-line global-require
+            const machineCore = require('../machine-core').default;
+            await machineCore.closeSession(sessionId, this.buildMachineCoreRPCContext({
+                action: 'session_close',
+                port,
+                socketId,
+                sessionId,
+            }));
+            log.info(`machine-core handled session close for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+            return true;
+        } catch (error) {
+            log.warn(`machine-core sidecar closeSession failed for ${port} after ${Date.now() - startedAt}ms: ${error.message}`);
+            return false;
+        }
+    }
+
+    async syncMachineCoreFileLoad(port, gcode, meta = {}, rpcContext = null) {
+        if (!shouldUseGoMachineCorePath('file_shadow') || !port || !gcode) {
+            return false;
+        }
+
+        const sessionId = this.machineCoreSessions.get(port);
+        if (!sessionId) {
+            return false;
+        }
+
+        const startedAt = Date.now();
+        // eslint-disable-next-line global-require
+        const machineCore = require('../machine-core').default;
+        await machineCore.loadFile(sessionId, {
+            name: meta.name,
+            gcode,
+            metadata: {
+                size: meta.size,
+                visualizer: meta.visualizer,
+                port,
+            },
+        }, rpcContext || this.buildMachineCoreRPCContext({
+            action: 'file_load',
+            port,
+            sessionId,
+        }));
+        log.info(`machine-core handled file load for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+        return true;
+    }
+
+    async syncMachineCoreFileUnload(port, rpcContext = null) {
+        if (!shouldUseGoMachineCorePath('file_shadow') || !port) {
+            return false;
+        }
+
+        const sessionId = this.machineCoreSessions.get(port);
+        if (!sessionId) {
+            return false;
+        }
+
+        const startedAt = Date.now();
+        // eslint-disable-next-line global-require
+        const machineCore = require('../machine-core').default;
+        await machineCore.unloadFile(sessionId, rpcContext || this.buildMachineCoreRPCContext({
+            action: 'file_unload',
+            port,
+            sessionId,
+        }));
+        log.info(`machine-core handled file unload for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+        return true;
+    }
+
+    async syncMachineCoreJobCommand(port, cmd, args = [], rpcContext = null) {
+        if (!shouldUseGoMachineCorePath('job_shadow') || !port) {
+            return false;
+        }
+
+        const sessionId = this.machineCoreSessions.get(port);
+        if (!sessionId) {
+            return false;
+        }
+
+        const startedAt = Date.now();
+        // eslint-disable-next-line global-require
+        const machineCore = require('../machine-core').default;
+        switch (cmd) {
+        case 'feeder:start':
+            await machineCore.startJob(sessionId, rpcContext || this.buildMachineCoreRPCContext({
+                action: 'job_start',
+                port,
+                sessionId,
+                commandType: cmd,
+            }));
+            log.info(`machine-core handled startJob for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+            return true;
+        case 'pause':
+        case 'gcode:pause':
+            await machineCore.pauseJob(sessionId, rpcContext || this.buildMachineCoreRPCContext({
+                action: 'job_pause',
+                port,
+                sessionId,
+                commandType: cmd,
+            }));
+            log.info(`machine-core handled pauseJob for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+            return true;
+        case 'resume':
+        case 'gcode:resume':
+            await machineCore.resumeJob(sessionId, rpcContext || this.buildMachineCoreRPCContext({
+                action: 'job_resume',
+                port,
+                sessionId,
+                commandType: cmd,
+            }));
+            log.info(`machine-core handled resumeJob for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+            return true;
+        case 'stop':
+        case 'gcode:stop':
+        case 'feeder:stop':
+            await machineCore.stopJob(sessionId, args[0] || {}, rpcContext || this.buildMachineCoreRPCContext({
+                action: 'job_stop',
+                port,
+                sessionId,
+                commandType: cmd,
+            }));
+            log.info(`machine-core handled stopJob for ${port} via Go sidecar in ${Date.now() - startedAt}ms`);
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    async dispatchControllerCommand(port, cmd, args = [], controller = null, socketId = null) {
+        const activeController = controller || store.get(`controllers["${port}"]`);
+        if (!activeController) {
+            throw new Error(`controller on "${port}" not accessible`);
+        }
+
+        const sessionId = this.machineCoreSessions.get(port);
+        const machineCoreHandled = await this.syncMachineCoreJobCommand(port, cmd, args, this.buildMachineCoreRPCContext({
+            action: 'controller_command',
+            port,
+            socketId,
+            sessionId,
+            commandType: cmd,
+        }));
+        activeController.command.apply(activeController, [cmd].concat(args));
+        return machineCoreHandled;
+    }
+
+    async loadWithMachineCore({ port, gcode, socketId = null, ...meta }) {
+        const useMachineCoreAuthority = shouldUseGoMachineCorePath('file_shadow')
+            && Boolean(port)
+            && Boolean(this.machineCoreSessions.get(port));
+
+        if (useMachineCoreAuthority) {
+            await this.syncMachineCoreFileLoad(port, gcode, meta, this.buildMachineCoreRPCContext({
+                action: 'file_load',
+                port,
+                socketId,
+                sessionId: this.machineCoreSessions.get(port),
+            }));
+        }
+
+        this.gcode = gcode;
+        this.meta = meta;
+
+        if (port) {
+            const controller = store.get(`controllers["${port}"]`);
+            if (controller) {
+                controller.loadFile(this.gcode, this.meta);
+            }
+        }
+
+        log.info(`Loaded file '${meta.name}' to CNCEngine`);
+        this.emit('file:load', gcode, meta.size, meta.name, meta.visualizer);
+    }
+
+    async unloadWithMachineCore(port = this.connection?.options?.port, socketId = null) {
+        const useMachineCoreAuthority = shouldUseGoMachineCorePath('file_shadow')
+            && Boolean(port)
+            && Boolean(this.machineCoreSessions.get(port));
+
+        if (useMachineCoreAuthority) {
+            await this.syncMachineCoreFileUnload(port, this.buildMachineCoreRPCContext({
+                action: 'file_unload',
+                port,
+                socketId,
+                sessionId: this.machineCoreSessions.get(port),
+            }));
+        }
+
+        log.info('Unloading file from CNCEngine');
+        this.gcode = null;
+        this.meta = null;
+        this.emit('file:unload');
+    }
+
+    runMachineCoreSidecar(task) {
+        Promise.resolve(task).catch((error) => {
+            log.warn(`machine-core sidecar task failed: ${error.message}`);
+        });
+    }
+
+    stringifyMachineCoreTelemetryValue(value) {
+        if (value === undefined || value === null) {
+            return undefined;
+        }
+        if (typeof value === 'string') {
+            return value;
+        }
+        if (typeof value === 'number' || typeof value === 'boolean') {
+            return String(value);
+        }
+        return JSON.stringify(value);
+    }
+
+    buildMachineCoreTelemetryMetadata(eventName, args = []) {
+        switch (eventName) {
+        case 'controller:state': {
+            const [controllerType, controllerState] = args;
+            return {
+                controller_type: this.stringifyMachineCoreTelemetryValue(controllerType),
+                controller_state: this.stringifyMachineCoreTelemetryValue(controllerState),
+            };
+        }
+        case 'controller:settings': {
+            const [controllerType, controllerSettings] = args;
+            return {
+                controller_type: this.stringifyMachineCoreTelemetryValue(controllerType),
+                controller_settings: this.stringifyMachineCoreTelemetryValue(controllerSettings),
+            };
+        }
+        case 'sender:status':
+            return {
+                sender_status: this.stringifyMachineCoreTelemetryValue(args[0]),
+            };
+        case 'feeder:status':
+            return {
+                feeder_status: this.stringifyMachineCoreTelemetryValue(args[0]),
+            };
+        case 'workflow:state':
+            return {
+                workflow_state: this.stringifyMachineCoreTelemetryValue(args[0]),
+            };
+        case 'homing:has-homed':
+            return {
+                homing_has_homed: this.stringifyMachineCoreTelemetryValue(Boolean(args[0])),
+            };
+        case 'error': {
+            const [errorPayload] = args;
+            const errorType = `${errorPayload?.type || ''}`.trim().toLowerCase();
+            return {
+                error_code: this.stringifyMachineCoreTelemetryValue(errorPayload?.code),
+                error_message: this.stringifyMachineCoreTelemetryValue(errorPayload?.description || errorPayload?.message),
+                error_is_alarm: this.stringifyMachineCoreTelemetryValue(errorType === 'alarm'),
+                has_alarm: this.stringifyMachineCoreTelemetryValue(errorType === 'alarm'),
+            };
+        }
+        default:
+            return null;
+        }
+    }
+
+    async syncMachineCoreRuntimeTelemetry(port, eventName, args = []) {
+        const sessionId = this.machineCoreSessions.get(port);
+        if (!sessionId) {
+            return false;
+        }
+
+        const metadata = this.buildMachineCoreTelemetryMetadata(eventName, args);
+        if (!metadata) {
+            return false;
+        }
+
+        const compactMetadata = Object.entries(metadata).reduce((accumulator, [key, value]) => {
+            if (value !== undefined && value !== null && value !== '') {
+                accumulator[key] = value;
+            }
+            return accumulator;
+        }, {});
+        if (Object.keys(compactMetadata).length === 0) {
+            return false;
+        }
+
+        // eslint-disable-next-line global-require
+        const machineCore = require('../machine-core').default;
+        await machineCore.sendCommand(sessionId, {
+            type: 'status_report',
+            metadata: compactMetadata,
+        }, this.buildMachineCoreRPCContext({
+            action: 'runtime_telemetry',
+            port,
+            sessionId,
+            commandType: 'status_report',
+            controllerEvent: eventName,
+        }));
+        return true;
+    }
+
+    installMachineCoreTelemetryBridge(controller, port) {
+        if (!controller || typeof controller.emit !== 'function' || !port) {
+            return controller;
+        }
+        if (controller.__machineCoreTelemetryBridgeInstalled) {
+            return controller;
+        }
+
+        const originalEmit = controller.emit.bind(controller);
+        const telemetryEvents = new Set([
+            'controller:state',
+            'controller:settings',
+            'sender:status',
+            'feeder:status',
+            'workflow:state',
+            'homing:has-homed',
+            'error',
+        ]);
+
+        controller.emit = (eventName, ...args) => {
+            const result = originalEmit(eventName, ...args);
+            if (telemetryEvents.has(eventName)) {
+                this.runMachineCoreSidecar(this.syncMachineCoreRuntimeTelemetry(port, eventName, args));
+            }
+            return result;
+        };
+        controller.__machineCoreTelemetryBridgeInstalled = true;
+        return controller;
+    }
 
     // @param {object} server The HTTP server instance.
     // @param {string} controller Specify CNC controller.
@@ -220,6 +689,8 @@ class CNCEngine {
                         });
                     }
 
+                    this.installMachineCoreTelemetryBridge(controller, port);
+
                     controller.addConnection(socket);
 
 
@@ -303,6 +774,8 @@ class CNCEngine {
             });
 
             socket.on('reconnect', (port) => {
+                this.runMachineCoreSidecar(this.syncMachineCoreSessionAttach(port, socket));
+
                 if (!this.connection) {
                     const message = 'No connection object found to reconnect to';
                     log.info(message);
@@ -337,6 +810,8 @@ class CNCEngine {
             });
 
             socket.on('addclient', (port) => {
+                this.runMachineCoreSidecar(this.syncMachineCoreSessionAttach(port, socket));
+
                 if (!this.connection) {
                     log.info('No connection object found to reconnect to');
                     return;
@@ -356,67 +831,16 @@ class CNCEngine {
             });
 
             // List the available serial ports
-            socket.on('list', () => {
+            socket.on('list', async () => {
                 log.debug(`socket.list(): id=${socket.id}`);
 
-                SerialPort.list()
-                    .then(ports => {
-                        ports = ports.concat(ensureArray(config.get('ports', [])));
-
-                        const controllers = store.get('controllers', {});
-                        const portsInUse =
-                            Object.keys(controllers).filter(port => {
-                                const controller = controllers[port];
-                                return controller && controller.isOpen();
-                            });
-
-                        // Filter ports by productId to avoid non-arduino devices from appearing
-                        const validProductIDs = ['0483', '6015', '6001', '606D', '003D', '0042', '0043', '2341', '7523', 'EA60', '2303', '2145', '0AD8', '08D8', '5740', '0FA7'];
-                        const validVendorIDs = ['16C0', '1D50', '0403', '2341', '0042', '1A86', '10C4', '067B', '03EB', '16D0', '0483'];
-                        let [recognizedPorts, unrecognizedPorts] = partition(ports, (port) => {
-                            if (!port.vendorId || !port.productId) {
-                                return false;
-                            }
-                            return (
-                                caseInsensitiveIncludes(validProductIDs, port.productId) &&
-                                caseInsensitiveIncludes(validVendorIDs, port.vendorId)
-                            );
-                        });
-
-                        const portInfoMapFn = (port) => {
-                            return {
-                                port: port.path,
-                                manufacturer: port.manufacturer,
-                                inuse: portsInUse.indexOf(port.path) >= 0
-                            };
-                        };
-
-                        recognizedPorts = recognizedPorts.map(portInfoMapFn);
-                        unrecognizedPorts = unrecognizedPorts.map(portInfoMapFn);
-                        //unrecognizedPorts = recognizedPorts;
-
-                        const networkPorts = this.networkDevices.map((port) => {
-                            return {
-                                port: port.ip,
-                                manufacturer: undefined,
-                                inuse: controllers[port],
-                            };
-                        });
-                        /*unrecognizedPorts = [{
-                            port: 'COM3',
-                            manufacturer: 'Microsoft',
-                            inuse: false
-                        }, {
-                            port: 'COM7',
-                            manufacturer: 'Broadcom',
-                            inuse: false
-                        }];*/
-
-                        socket.emit('serialport:list', recognizedPorts, unrecognizedPorts, networkPorts);
-                    })
-                    .catch(err => {
-                        log.error(err);
-                    });
+                try {
+                    const devices = await this.listSocketDevices();
+                    const { recognizedPorts, unrecognizedPorts, networkPorts } = partitionDevicesForLegacySocket(devices);
+                    socket.emit('serialport:list', recognizedPorts, unrecognizedPorts, networkPorts);
+                } catch (err) {
+                    log.error(err);
+                }
             });
 
             //Sends back a list of available IPs in the computer
@@ -440,8 +864,9 @@ class CNCEngine {
             });
 
             // Open serial port
-            socket.on('open', (port, options, callback) => {
+            socket.on('open', async (port, options, callback) => {
                 const engine = this;
+                let reservedGoSession = false;
 
                 log.debug(`socket.open("${port}", ${JSON.stringify(options)}): id=${socket.id}`);
 
@@ -471,8 +896,23 @@ class CNCEngine {
                     return;
                 }
 
+                if (shouldUseGoMachineCorePath('session_open')) {
+                    try {
+                        await this.syncMachineCoreSessionOpen(port, options, socket);
+                        reservedGoSession = true;
+                    } catch (error) {
+                        log.warn(`machine-core sidecar openSession failed for ${port}: ${error.message}`);
+                        this.connection = null;
+                        callback(error);
+                        return;
+                    }
+                }
+
                 this.connection.open((err = null) => {
                     if (err) {
+                        if (reservedGoSession) {
+                            this.runMachineCoreSidecar(this.syncMachineCoreSessionClose(port, socket?.id));
+                        }
                         callback(err);
                         this.connection = null;
                         return;
@@ -518,6 +958,7 @@ class CNCEngine {
                 if (!numClients || numClients <= 1) { // if only this one was connected
                     this.connection.close();
                     this.connection = null;
+                    this.runMachineCoreSidecar(this.syncMachineCoreSessionClose(port, socket?.id));
                     controller.close(err => {
                         // Remove controller from store
                         store.unset(`controllers[${JSON.stringify(port)}]`);
@@ -534,7 +975,7 @@ class CNCEngine {
                 });
             });
 
-            socket.on('command', (port, cmd, ...args) => {
+            socket.on('command', async (port, cmd, ...args) => {
                 log.debug(`socket.command("${port}", "${cmd}"): id=${socket.id}`);
 
                 if (!this.connection || this.connection.isClose()) {
@@ -542,13 +983,12 @@ class CNCEngine {
                     return;
                 }
 
-                const controller = store.get(`controllers["${port}"]`);
-                if (!controller) {
-                    log.error(`controller on "${port}" not accessible`);
-                    return;
+                try {
+                    await this.dispatchControllerCommand(port, cmd, args, null, socket.id);
+                } catch (error) {
+                    log.error(error.message);
+                    socket.emit('task:error', error.message);
                 }
-
-                controller.command.apply(controller, [cmd].concat(args));
             });
 
             socket.on('flash:start', (flashPort, imageType, isHal = false, data = null) => {
@@ -698,26 +1138,11 @@ class CNCEngine {
     /* Functions related to loading file through server */
     // If gcode is going to live in CNCengine, we need functions to access or unload it.
     load({ port, gcode, ...meta }) {
-        this.gcode = gcode;
-        this.meta = meta;
-
-        // Load the file to the sender if controller connection exists
-        if (port) {
-            const controller = store.get(`controllers["${port}"]`);
-            if (controller) {
-                controller.loadFile(this.gcode, this.meta);
-            }
-        }
-
-        log.info(`Loaded file '${meta.name}' to CNCEngine`);
-        this.emit('file:load', gcode, meta.size, meta.name, meta.visualizer);
+        this.runMachineCoreSidecar(this.loadWithMachineCore({ port, gcode, ...meta }));
     }
 
     unload() {
-        log.info('Unloading file from CNCEngine');
-        this.gcode = null;
-        this.meta = null;
-        this.emit('file:unload');
+        this.runMachineCoreSidecar(this.unloadWithMachineCore());
     }
 
     fetchGcode() {

@@ -130,6 +130,53 @@ const ensureArray = (...args: Array<any>) => {
 
 const noop = () => {};
 
+const buildLegacyWorkflowStateFromSessionEvent = (event: any = {}) => {
+    switch (event.type) {
+        case 'job_started':
+        case 'job_resumed':
+            return 'running';
+        case 'job_paused':
+            return 'paused';
+        case 'job_stopped':
+        case 'file_loaded':
+        case 'file_unloaded':
+            return 'idle';
+        default:
+            return null;
+    }
+};
+
+const buildLegacySenderStatusFromSessionEvent = (event: any = {}) => {
+    const workflowState = buildLegacyWorkflowStateFromSessionEvent(event);
+    if (!workflowState) {
+        return null;
+    }
+
+    return {
+        workflowState,
+        active: workflowState === 'running' || workflowState === 'paused',
+    };
+};
+
+const buildLegacyHomingStateFromSessionInput = (input: any = {}) => {
+    const homingRequired = input.homing_required ?? input.homingRequired;
+    const hasHomed = input.has_homed ?? input.hasHomed;
+
+    if (homingRequired === undefined && hasHomed === undefined) {
+        return null;
+    }
+
+    return {
+        homingRequired: Boolean(homingRequired),
+        hasHomed: Boolean(hasHomed),
+    };
+};
+
+const extractControllerTypeFromSessionInput = (input: any = {}) => {
+    const controllerType = input.controller_type || input.controllerType;
+    return controllerType ? String(controllerType) : null;
+};
+
 class Controller {
     io: Function = noop;
 
@@ -310,6 +357,39 @@ class Controller {
         this.socket && this.socket.disconnect();
         this.socket = this.io(host, options).connect();
 
+        const dispatchControllerEvent = (eventName: string, ...args: Array<any>) => {
+            if (eventName === 'serialport:open') {
+                const { controllerType = '', port = '' } = { ...args[0] };
+                this.port = port;
+                this.type = controllerType;
+            }
+            if (eventName === 'serialport:close') {
+                this.port = '';
+                this.type = '';
+                this.state = {};
+                this.settings = {};
+                this.workflow.state = 'idle';
+            }
+            if (eventName === 'workflow:state') {
+                this.workflow.state = args[0];
+            }
+            if (eventName === 'controller:settings') {
+                this.type = args[0];
+                this.settings = { ...args[1] };
+            }
+            if (eventName === 'controller:state') {
+                this.type = args[0];
+                this.state = { ...args[1] };
+            }
+
+            const listeners: Array<Function> = ensureArray(
+                this.listeners[eventName as keyof typeof this.listeners],
+            );
+            listeners.forEach((listener) => {
+                listener(...args);
+            });
+        };
+
         this.socket.on('disconnect', (reason) => {
             if (reason !== 'io client disconnect') {
                 this.reconnect();
@@ -322,37 +402,192 @@ class Controller {
             }
 
             this.socket.on(eventName, (...args) => {
-                if (eventName === 'serialport:open') {
-                    const { controllerType = '', port = '' } = { ...args[0] };
-                    this.port = port;
-                    this.type = controllerType;
-                }
-                if (eventName === 'serialport:close') {
-                    this.port = '';
-                    this.type = '';
-                    this.state = {};
-                    this.settings = {};
-                    this.workflow.state = 'idle';
-                }
-                if (eventName === 'workflow:state') {
-                    this.workflow.state = args[0];
-                }
-                if (eventName === 'controller:settings') {
-                    this.type = args[0];
-                    this.settings = { ...args[1] };
-                }
-                if (eventName === 'controller:state') {
-                    this.type = args[0];
-                    this.state = { ...args[1] };
-                }
-
-                const listeners: Array<Function> = ensureArray(
-                    this.listeners[eventName as keyof typeof this.listeners],
-                );
-                listeners.forEach((listener) => {
-                    listener(...args);
-                });
+                dispatchControllerEvent(eventName, ...args);
             });
+        });
+
+        this.socket.on('machine:session:event', (event) => {
+            if (!event || typeof event !== 'object') {
+                return;
+            }
+
+            const payload =
+                event.payload && typeof event.payload === 'object'
+                    ? event.payload
+                    : {};
+            const workflowState =
+                buildLegacyWorkflowStateFromSessionEvent(event);
+            if (workflowState) {
+                dispatchControllerEvent('workflow:state', workflowState);
+            }
+
+            const senderStatus =
+                buildLegacySenderStatusFromSessionEvent(event);
+            if (senderStatus) {
+                dispatchControllerEvent('sender:status', senderStatus);
+            }
+
+            switch (event.type) {
+                case 'file_loaded':
+                    if (payload.file) {
+                        dispatchControllerEvent(
+                            'file:load',
+                            payload.file.content,
+                            payload.file.size,
+                            payload.file.name,
+                            payload.file.visualizer,
+                        );
+                    }
+                    break;
+                case 'file_unloaded':
+                    dispatchControllerEvent('file:unload');
+                    break;
+                case 'session_closed':
+                    dispatchControllerEvent('serialport:close', {
+                        port: payload.device_id || payload.deviceId,
+                    });
+                    break;
+                case 'controller_settings_changed': {
+                    const controllerType =
+                        extractControllerTypeFromSessionInput(payload);
+                    if (controllerType) {
+                        dispatchControllerEvent(
+                            'controller:settings',
+                            controllerType,
+                            payload,
+                        );
+                    }
+                    break;
+                }
+                case 'controller_state_changed': {
+                    const controllerType =
+                        extractControllerTypeFromSessionInput(payload);
+                    if (controllerType) {
+                        dispatchControllerEvent(
+                            'controller:state',
+                            controllerType,
+                            payload,
+                        );
+                    }
+                    break;
+                }
+                case 'sender_status_changed':
+                    dispatchControllerEvent('sender:status', payload);
+                    break;
+                case 'feeder_status_changed':
+                    dispatchControllerEvent('feeder:status', payload);
+                    break;
+                case 'error_raised':
+                case 'alarm_raised':
+                    dispatchControllerEvent('error', payload);
+                    break;
+                case 'homing_state_changed': {
+                    const homingState =
+                        buildLegacyHomingStateFromSessionInput(payload);
+                    if (homingState) {
+                        dispatchControllerEvent(
+                            'homing:has-homed',
+                            homingState.hasHomed,
+                        );
+                    }
+                    break;
+                }
+                case 'flash_started': {
+                    const deviceId =
+                        payload.device_id || payload.deviceId || 'device';
+                    dispatchControllerEvent('flash:message', {
+                        type: 'Info',
+                        content: `Starting flash on ${deviceId}.`,
+                    });
+                    break;
+                }
+                case 'flash_progress': {
+                    const progress = Number(payload.progress);
+                    if (!Number.isNaN(progress)) {
+                        dispatchControllerEvent(
+                            'flash:progress',
+                            progress,
+                            100,
+                        );
+                    }
+                    break;
+                }
+                case 'flash_completed':
+                    dispatchControllerEvent('flash:end');
+                    break;
+                default:
+                    break;
+            }
+        });
+
+        this.socket.on('machine:session:snapshot', (snapshot) => {
+            if (!snapshot || typeof snapshot !== 'object') {
+                return;
+            }
+
+            const controllerType =
+                snapshot?.session?.controller_type ||
+                snapshot?.session?.controllerType;
+            const port =
+                snapshot?.session?.device_id || snapshot?.session?.deviceId;
+
+            if (controllerType) {
+                dispatchControllerEvent(
+                    'serialport:openController',
+                    controllerType,
+                );
+            }
+            if (controllerType && snapshot.controller_settings) {
+                dispatchControllerEvent(
+                    'controller:settings',
+                    controllerType,
+                    snapshot.controller_settings,
+                );
+            }
+            if (controllerType && snapshot.controller_state) {
+                dispatchControllerEvent(
+                    'controller:state',
+                    controllerType,
+                    snapshot.controller_state,
+                );
+            }
+            if (snapshot.sender_status) {
+                dispatchControllerEvent('sender:status', snapshot.sender_status);
+            }
+            if (snapshot.feeder_status) {
+                dispatchControllerEvent('feeder:status', snapshot.feeder_status);
+            }
+            const homingState = buildLegacyHomingStateFromSessionInput(
+                snapshot.homing_state || snapshot.homingState,
+            );
+            if (homingState) {
+                dispatchControllerEvent(
+                    'homing:has-homed',
+                    homingState.hasHomed,
+                );
+            }
+            const workflowState =
+                snapshot?.session?.workflow_state ||
+                snapshot?.session?.workflowState;
+            if (workflowState) {
+                dispatchControllerEvent('workflow:state', workflowState);
+            }
+            if (port && controllerType) {
+                dispatchControllerEvent('serialport:open', {
+                    port,
+                    controllerType,
+                    inuse: true,
+                });
+            }
+            if (snapshot.loaded_file) {
+                dispatchControllerEvent(
+                    'file:load',
+                    snapshot.loaded_file.content,
+                    snapshot.loaded_file.size,
+                    snapshot.loaded_file.name,
+                    snapshot.loaded_file.visualizer,
+                );
+            }
         });
 
         this.socket.on('startup', (data) => {

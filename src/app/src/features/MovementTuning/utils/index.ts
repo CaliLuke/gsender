@@ -17,6 +17,10 @@ export const calculateNewStepsPerMM = ({
     givenDistanceMoved: number;
     actualDistanceMoved: number;
 }) => {
+    if (!actualDistanceMoved) {
+        return 0;
+    }
+
     return Number(
         (
             originalStepsPerMM *
