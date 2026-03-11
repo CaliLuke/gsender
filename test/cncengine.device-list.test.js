@@ -74,6 +74,7 @@ jest.mock('../src/server/services/machine-core', () => ({
         openSession: jest.fn(),
         closeSession: jest.fn(),
         sendCommand: jest.fn(),
+        flashFirmware: jest.fn(),
         loadFile: jest.fn(),
         unloadFile: jest.fn(),
         startJob: jest.fn(),
@@ -276,6 +277,26 @@ describe('CNCEngine device list authority', () => {
         expect(controller.command).not.toHaveBeenCalled();
     });
 
+    test('falls back to the legacy controller when machine-core transport fails during job shadowing', async () => {
+        shouldUseGoMachineCorePath.mockImplementation((pathName) => pathName === 'job_shadow');
+        const transportError = new Error('14 UNAVAILABLE: connection refused');
+        transportError.code = 14;
+        machineCore.pauseJob.mockRejectedValue(transportError);
+
+        const controller = {
+            command: jest.fn(),
+        };
+
+        const engine = new CNCEngine();
+        engine.machineCoreSessions.set('/dev/ttyUSB0', 'session-1');
+
+        await expect(engine.dispatchControllerCommand('/dev/ttyUSB0', 'gcode:pause', [], controller)).resolves.toBe(false);
+
+        expect(machineCore.pauseJob).toHaveBeenCalled();
+        expect(controller.command).toHaveBeenCalledWith('gcode:pause');
+        expect(mockLog.warn).toHaveBeenCalledWith(expect.stringContaining('falling back to legacy controller'));
+    });
+
     test('reserves Go session ownership during session open', async () => {
         shouldUseGoMachineCorePath.mockImplementation((pathName) => pathName === 'session_open');
         machineCore.openSession.mockResolvedValue({
@@ -327,8 +348,9 @@ describe('CNCEngine device list authority', () => {
             description: 'Door open',
         });
 
-        await Promise.resolve();
-        await Promise.resolve();
+        await engine.flushMachineCoreRuntimeTelemetry('/dev/ttyUSB0');
+
+        expect(machineCore.sendCommand).toHaveBeenCalledTimes(3);
 
         expect(machineCore.sendCommand).toHaveBeenCalledWith('session-1', {
             type: 'status_report',
@@ -371,6 +393,110 @@ describe('CNCEngine device list authority', () => {
         }, expect.objectContaining({
             action: 'runtime_telemetry',
             controller_event: 'error',
+        }));
+    });
+
+    test('coalesces high-frequency telemetry before sending to machine-core', async () => {
+        machineCore.sendCommand.mockResolvedValue({ accepted: true });
+
+        const engine = new CNCEngine();
+        engine.machineCoreSessions.set('/dev/ttyUSB0', 'session-1');
+
+        const controller = {
+            emit: jest.fn(),
+        };
+        engine.installMachineCoreTelemetryBridge(controller, '/dev/ttyUSB0');
+
+        controller.emit('sender:status', { total: 100, sent: 10 });
+        controller.emit('sender:status', { total: 100, sent: 20 });
+        controller.emit('sender:status', { total: 100, sent: 30 });
+
+        await engine.flushMachineCoreRuntimeTelemetry('/dev/ttyUSB0');
+
+        expect(machineCore.sendCommand).toHaveBeenCalledTimes(1);
+        expect(machineCore.sendCommand).toHaveBeenCalledWith('session-1', {
+            type: 'status_report',
+            metadata: {
+                sender_status: JSON.stringify({
+                    total: 100,
+                    sent: 30,
+                }),
+            },
+        }, expect.objectContaining({
+            controller_event: 'sender:status',
+        }));
+    });
+
+    test('awaits machine-core attach replay before reattaching the legacy socket', async () => {
+        let resolveAttach;
+        const attachPromise = new Promise((resolve) => {
+            resolveAttach = resolve;
+        });
+
+        shouldUseGoMachineCorePath.mockImplementation((pathName) => pathName === 'session_attach');
+
+        const socket = {
+            id: 'socket-1',
+            join: jest.fn(),
+        };
+        const connection = {
+            addConnection: jest.fn(),
+            isOpen: jest.fn(() => true),
+        };
+        const controller = {
+            addConnection: jest.fn(),
+            isOpen: jest.fn(() => true),
+        };
+
+        mockStore.get.mockImplementation((key) => {
+            if (key === 'controllers["/dev/ttyUSB0"]') {
+                return controller;
+            }
+            return {};
+        });
+
+        const engine = new CNCEngine();
+        engine.connection = connection;
+        engine.syncMachineCoreSessionAttach = jest.fn(() => attachPromise);
+        engine.io = { emit: jest.fn() };
+
+        const pendingAttach = engine.attachSocketToExistingSession('/dev/ttyUSB0', socket);
+
+        expect(engine.syncMachineCoreSessionAttach).toHaveBeenCalledWith('/dev/ttyUSB0', socket);
+        expect(connection.addConnection).not.toHaveBeenCalled();
+        expect(controller.addConnection).not.toHaveBeenCalled();
+
+        resolveAttach(true);
+        await pendingAttach;
+
+        expect(connection.addConnection).toHaveBeenCalledWith(socket);
+        expect(controller.addConnection).toHaveBeenCalledWith(socket);
+        expect(socket.join).toHaveBeenCalledWith('/dev/ttyUSB0');
+    });
+
+    test('mirrors flash lifecycle into machine-core before starting the legacy flasher', async () => {
+        shouldUseGoMachineCorePath.mockImplementation((pathName) => pathName === 'flash_state');
+        machineCore.flashFirmware.mockResolvedValue({ accepted: true });
+
+        const engine = new CNCEngine();
+        engine.machineCoreSessions.set('/dev/ttyUSB0', 'session-1');
+
+        await expect(engine.syncMachineCoreFlashLifecycle('/dev/ttyUSB0', 'longboard', {
+            hex: 'ABC123',
+            controllerType: 'grblHAL',
+        }, 'socket-1')).resolves.toBe(true);
+
+        expect(machineCore.flashFirmware).toHaveBeenCalledWith({
+            device_id: '/dev/ttyUSB0',
+            image: 'longboard',
+            hex: 'ABC123',
+            controller_type: 'grblHAL',
+        }, expect.objectContaining({
+            action: 'flash_start',
+            port: '/dev/ttyUSB0',
+            socket_id: 'socket-1',
+            session_id: 'session-1',
+            command_type: 'flash_firmware',
         }));
     });
 });

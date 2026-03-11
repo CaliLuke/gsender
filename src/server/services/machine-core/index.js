@@ -137,6 +137,9 @@ const legacyAdapter = {
     },
     sendCommand: (sessionId, command) => {
         throw new Error(`sendCommand() not implemented for legacy adapter: ${sessionId}, ${command?.type || 'unknown'}`);
+    },
+    flashFirmware: (payload) => {
+        throw new Error(`flashFirmware() not implemented for legacy adapter: ${JSON.stringify(payload)}`);
     }
 };
 
@@ -261,6 +264,23 @@ const mapLoadFilePayload = (sessionId, file = {}) => {
     });
 
     return payload;
+};
+
+const mapFlashFirmwarePayload = (payload = {}) => {
+    const result = {
+        device_id: String(pickFirst(payload.device_id, payload.deviceId, payload.port) || ''),
+        image: String(pickFirst(payload.image, payload.image_type, payload.imageType) || ''),
+        hex: toGoString(payload.hex),
+        controller_type: toGoString(pickFirst(payload.controller_type, payload.controllerType)),
+    };
+
+    Object.keys(result).forEach((key) => {
+        if (result[key] === undefined) {
+            delete result[key];
+        }
+    });
+
+    return result;
 };
 
 const mapRPCContextMetadata = (rpcContext = {}) => {
@@ -515,6 +535,9 @@ const createGoMachineCoreAdapter = () => {
         sendCommand: (sessionId, command, rpcContext = null) => {
             return timedCall('SendCommand', mapSendCommandPayload(sessionId, command), rpcContext);
         },
+        flashFirmware: (payload, rpcContext = null) => {
+            return timedCall('FlashFirmware', mapFlashFirmwarePayload(payload), rpcContext);
+        },
     };
 };
 
@@ -610,6 +633,10 @@ const sendCommand = (sessionId, command, rpcContext) => {
     return getAdapter().sendCommand(sessionId, command, rpcContext);
 };
 
+const flashFirmware = (payload, rpcContext) => {
+    return getAdapter().flashFirmware(payload, rpcContext);
+};
+
 export default {
     start,
     stop,
@@ -629,7 +656,8 @@ export default {
     attachClient,
     replayEvents,
     detachClient,
-    sendCommand
+    sendCommand,
+    flashFirmware
 };
 
 export {
@@ -648,6 +676,7 @@ export const __private__ = {
     mapCommandPayload,
     mapSendCommandPayload,
     mapLoadFilePayload,
+    mapFlashFirmwarePayload,
     unwrapListDevicesResponse,
     deviceDiscoveryKey,
     mergeGoDeviceWithLegacyMetadata,

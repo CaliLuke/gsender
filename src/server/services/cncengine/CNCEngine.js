@@ -117,6 +117,12 @@ class CNCEngine {
 
     machineCoreRequestCounter = 0;
 
+    machineCoreTelemetryPending = new Map();
+
+    machineCoreTelemetryFlushScheduled = new Set();
+
+    machineCoreTelemetryFlushInFlight = new Map();
+
     // Event Trigger
     event = new EventTrigger((event, trigger, commands) => {
         log.debug(`EventTrigger: event="${event}", trigger="${trigger}", commands="${commands}"`);
@@ -251,6 +257,66 @@ class CNCEngine {
             log.warn(`machine-core sidecar attach failed for ${port} after ${Date.now() - startedAt}ms: ${error.message}`);
             return false;
         }
+    }
+
+    isMachineCoreTransportError(error) {
+        if (!error) {
+            return false;
+        }
+
+        const transportCodes = new Set([1, 4, 14]);
+        if (transportCodes.has(error.code)) {
+            return true;
+        }
+
+        const message = `${error.message || ''}`.toLowerCase();
+        return message.includes('machine-core grpc transport unavailable')
+            || message.includes('connect failed')
+            || message.includes('connection refused')
+            || message.includes('no connection established')
+            || message.includes('14 unavailable')
+            || message.includes('deadline exceeded');
+    }
+
+    async attachSocketToExistingSession(port, socket, { emitErrors = true } = {}) {
+        if (shouldUseGoMachineCorePath('session_attach')) {
+            try {
+                await this.syncMachineCoreSessionAttach(port, socket);
+            } catch (error) {
+                log.warn(`machine-core ordered attach failed for ${port}: ${error.message}`);
+            }
+        }
+
+        if (!this.connection) {
+            const message = 'No connection object found to reconnect to';
+            log.info(message);
+            if (emitErrors) {
+                this.io.emit('task:error', message);
+            }
+            return false;
+        }
+
+        log.info(`Attaching socket ${socket.id} to connection on port ${port}`);
+        this.connection.addConnection(socket);
+        if (this.connection.isOpen()) {
+            socket.join(port);
+        } else {
+            log.info('Connection no longer open');
+        }
+
+        const controller = store.get(`controllers["${port}"]`);
+        if (!controller) {
+            const message = `No controller found on port ${port} to reconnect to`;
+            log.info(message);
+            if (emitErrors) {
+                this.io.emit('task:error', message);
+            }
+            return false;
+        }
+
+        controller.addConnection(socket);
+        log.info(`Controller state: ${controller.isOpen?.()}`);
+        return true;
     }
 
     async syncMachineCoreSessionClose(port, socketId = null) {
@@ -401,13 +467,21 @@ class CNCEngine {
         }
 
         const sessionId = this.machineCoreSessions.get(port);
-        const machineCoreHandled = await this.syncMachineCoreJobCommand(port, cmd, args, this.buildMachineCoreRPCContext({
-            action: 'controller_command',
-            port,
-            socketId,
-            sessionId,
-            commandType: cmd,
-        }));
+        let machineCoreHandled = false;
+        try {
+            machineCoreHandled = await this.syncMachineCoreJobCommand(port, cmd, args, this.buildMachineCoreRPCContext({
+                action: 'controller_command',
+                port,
+                socketId,
+                sessionId,
+                commandType: cmd,
+            }));
+        } catch (error) {
+            if (!this.isMachineCoreTransportError(error)) {
+                throw error;
+            }
+            log.warn(`machine-core transport failed for "${cmd}" on ${port}, falling back to legacy controller: ${error.message}`);
+        }
         activeController.command.apply(activeController, [cmd].concat(args));
         return machineCoreHandled;
     }
@@ -464,6 +538,63 @@ class CNCEngine {
         Promise.resolve(task).catch((error) => {
             log.warn(`machine-core sidecar task failed: ${error.message}`);
         });
+    }
+
+    queueMachineCoreRuntimeTelemetry(port, eventName, args = []) {
+        if (!port || !this.machineCoreSessions.get(port)) {
+            return;
+        }
+
+        const pendingByEvent = this.machineCoreTelemetryPending.get(port) || new Map();
+        pendingByEvent.set(eventName, args);
+        this.machineCoreTelemetryPending.set(port, pendingByEvent);
+
+        if (this.machineCoreTelemetryFlushScheduled.has(port) || this.machineCoreTelemetryFlushInFlight.get(port)) {
+            return;
+        }
+
+        this.machineCoreTelemetryFlushScheduled.add(port);
+        Promise.resolve().then(() => this.flushMachineCoreRuntimeTelemetry(port));
+    }
+
+    async flushMachineCoreRuntimeTelemetry(port) {
+        if (this.machineCoreTelemetryFlushInFlight.get(port)) {
+            return this.machineCoreTelemetryFlushInFlight.get(port);
+        }
+
+        const flushPromise = (async () => {
+            this.machineCoreTelemetryFlushScheduled.delete(port);
+            while (true) {
+                const pendingByEvent = this.machineCoreTelemetryPending.get(port);
+                if (!pendingByEvent || pendingByEvent.size === 0) {
+                    this.machineCoreTelemetryPending.delete(port);
+                    break;
+                }
+
+                const pendingEntries = Array.from(pendingByEvent.entries());
+                this.machineCoreTelemetryPending.delete(port);
+
+                for (const [eventName, args] of pendingEntries) {
+                    try {
+                        await this.syncMachineCoreRuntimeTelemetry(port, eventName, args);
+                    } catch (error) {
+                        log.warn(`machine-core telemetry sync failed for ${port} (${eventName}): ${error.message}`);
+                    }
+                }
+            }
+        })();
+
+        this.machineCoreTelemetryFlushInFlight.set(port, flushPromise);
+        try {
+            await flushPromise;
+        } finally {
+            this.machineCoreTelemetryFlushInFlight.delete(port);
+            if ((this.machineCoreTelemetryPending.get(port)?.size || 0) > 0
+                && !this.machineCoreTelemetryFlushScheduled.has(port)) {
+                this.machineCoreTelemetryFlushScheduled.add(port);
+                Promise.resolve().then(() => this.flushMachineCoreRuntimeTelemetry(port));
+            }
+        }
     }
 
     stringifyMachineCoreTelemetryValue(value) {
@@ -562,6 +693,28 @@ class CNCEngine {
         return true;
     }
 
+    async syncMachineCoreFlashLifecycle(deviceId, image, options = {}, socketId = null) {
+        if (!shouldUseGoMachineCorePath('flash_state') || !deviceId || !image) {
+            return false;
+        }
+
+        // eslint-disable-next-line global-require
+        const machineCore = require('../machine-core').default;
+        await machineCore.flashFirmware({
+            device_id: deviceId,
+            image,
+            hex: options.hex,
+            controller_type: options.controllerType,
+        }, this.buildMachineCoreRPCContext({
+            action: 'flash_start',
+            port: deviceId,
+            socketId,
+            sessionId: this.machineCoreSessions.get(deviceId),
+            commandType: 'flash_firmware',
+        }));
+        return true;
+    }
+
     installMachineCoreTelemetryBridge(controller, port) {
         if (!controller || typeof controller.emit !== 'function' || !port) {
             return controller;
@@ -584,7 +737,7 @@ class CNCEngine {
         controller.emit = (eventName, ...args) => {
             const result = originalEmit(eventName, ...args);
             if (telemetryEvents.has(eventName)) {
-                this.runMachineCoreSidecar(this.syncMachineCoreRuntimeTelemetry(port, eventName, args));
+                this.queueMachineCoreRuntimeTelemetry(port, eventName, args);
             }
             return result;
         };
@@ -773,61 +926,12 @@ class CNCEngine {
                 this.sockets.splice(this.sockets.indexOf(socket), 1);
             });
 
-            socket.on('reconnect', (port) => {
-                this.runMachineCoreSidecar(this.syncMachineCoreSessionAttach(port, socket));
-
-                if (!this.connection) {
-                    const message = 'No connection object found to reconnect to';
-                    log.info(message);
-                    this.io.emit('task:error', message);
-                    return;
-                }
-                log.info(`Reconnecting to open controller on port ${port} with socket ID ${socket.id}`);
-                this.connection.addConnection(socket);
-                if (this.connection.isOpen()) {
-                    log.info('Joining port room on socket');
-                    socket.join(port);
-                } else {
-                    log.info('connection no longer open');
-                }
-
-                let controller = store.get(`controllers["${port}"]`);
-                if (!controller) {
-                    const message = `No controller found on port ${port} to reconnect to`;
-                    log.info(message);
-                    this.io.emit('task:error', message);
-                    return;
-                }
-                log.info(`Reconnecting to open controller on port ${port} with socket ID ${socket.id}`);
-                controller.addConnection(socket);
-                log.info(`Controller state: ${controller.isOpen()}`);
-                if (this.connection.isOpen()) {
-                    log.info('Joining port room on socket');
-                    socket.join(port);
-                } else {
-                    log.info('Connection no longer open');
-                }
+            socket.on('reconnect', async (port) => {
+                await this.attachSocketToExistingSession(port, socket, { emitErrors: true });
             });
 
-            socket.on('addclient', (port) => {
-                this.runMachineCoreSidecar(this.syncMachineCoreSessionAttach(port, socket));
-
-                if (!this.connection) {
-                    log.info('No connection object found to reconnect to');
-                    return;
-                }
-                log.info(`Adding new client to connection on port ${port} with socket ID ${socket.id}`);
-                this.connection.addConnection(socket);
-                log.info(`connection state: ${this.connection.isOpen()}`);
-
-                let controller = store.get(`controllers["${port}"]`);
-                if (!controller) {
-                    log.info(`No controller found on port ${port} to reconnect to`);
-                    return;
-                }
-                log.info(`Adding new client to controller on port ${port} with socket ID ${socket.id}`);
-                controller.addConnection(socket);
-                log.info(`Connection state: ${this.connection.isOpen()}`);
+            socket.on('addclient', async (port) => {
+                await this.attachSocketToExistingSession(port, socket, { emitErrors: false });
             });
 
             // List the available serial ports
@@ -991,12 +1095,26 @@ class CNCEngine {
                 }
             });
 
-            socket.on('flash:start', (flashPort, imageType, isHal = false, data = null) => {
+            socket.on('flash:start', async (flashPort, imageType, isHal = false, data = null) => {
                 log.debug(`Flashing ${flashPort}, isHal: ${isHal}, imageType: ${imageType}`);
                 if (!flashPort) {
                     log.error('task:error', 'No port specified - make sure you connect to you device at least once before attempting flashing');
                     return;
                 }
+
+                try {
+                    await this.syncMachineCoreFlashLifecycle(flashPort, imageType, {
+                        hex: data,
+                        controllerType: isHal ? 'grblHAL' : undefined,
+                    }, socket?.id);
+                } catch (error) {
+                    log.warn(`machine-core flash lifecycle rejected for ${flashPort}: ${error.message}`);
+                    socket.emit('task:error', error.message);
+                    this.emit('flash:message', { type: 'Error', content: error.message });
+                    this.emit('flash:end');
+                    return;
+                }
+
                 let halFlasher;
                 if (isHal) {
                     halFlasher = new DFUFlasher({
