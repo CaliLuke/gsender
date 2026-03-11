@@ -545,16 +545,29 @@ const shouldUseGoMachineCore = () => {
     return GRPC_MODE.test(String(process.env.MACHINE_CORE_TRANSPORT || process.env.MACHINE_CORE_MODE || ''));
 };
 
-const defaultAdapter = shouldUseGoMachineCore()
-    ? createGoMachineCoreAdapter()
-    : legacyAdapter;
+let activeAdapter = null;
+let activeAdapterKey = null;
 
-let activeAdapter = defaultAdapter;
+const resolveDefaultAdapter = () => {
+    const adapterKey = shouldUseGoMachineCore()
+        ? `go:${normalizeMachineCoreAddress(process.env.MACHINE_CORE_ADDR || MACHINE_CORE_ADDR_FALLBACK)}`
+        : 'legacy';
 
-const getAdapter = () => activeAdapter;
+    if (!activeAdapter || activeAdapterKey !== adapterKey) {
+        activeAdapter = shouldUseGoMachineCore()
+            ? createGoMachineCoreAdapter()
+            : legacyAdapter;
+        activeAdapterKey = adapterKey;
+    }
 
-const setAdapter = (adapter = defaultAdapter) => {
+    return activeAdapter;
+};
+
+const getAdapter = () => activeAdapter || resolveDefaultAdapter();
+
+const setAdapter = (adapter = null) => {
     activeAdapter = adapter;
+    activeAdapterKey = adapter ? 'manual' : null;
 };
 
 const start = (server, controller) => {

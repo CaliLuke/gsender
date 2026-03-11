@@ -62,6 +62,22 @@ const waitForReady = async (addr, timeoutMs = START_TIMEOUT_MS) => {
     return false;
 };
 
+const reserveEphemeralAddress = () => new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+        const address = server.address();
+        server.close((error) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+            resolve(`127.0.0.1:${address.port}`);
+        });
+    });
+});
+
 const resolveRepoRoot = () => {
     const candidates = [
         process.cwd(),
@@ -126,12 +142,16 @@ const shouldAutostart = () => {
     return !['0', 'false', 'no', 'off'].includes(raw);
 };
 
-const ensureMachineCoreProcess = async (addr = process.env.MACHINE_CORE_ADDR || DEFAULT_ADDR) => {
+const ensureMachineCoreProcess = async (addr = process.env.MACHINE_CORE_ADDR) => {
     if (!shouldAutostart()) {
         return false;
     }
 
-    const normalizedAddr = normalizeAddress(addr);
+    const normalizedAddr = addr
+        ? normalizeAddress(addr)
+        : await reserveEphemeralAddress();
+    process.env.MACHINE_CORE_ADDR = normalizedAddr;
+
     if (await canConnect(parseHostPort(normalizedAddr))) {
         log.info(`machine-core already reachable at ${normalizedAddr}`);
         return false;
@@ -190,4 +210,5 @@ export {
     ensureMachineCoreProcess,
     normalizeAddress,
     parseHostPort,
+    reserveEphemeralAddress,
 };
