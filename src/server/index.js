@@ -44,6 +44,7 @@ import webappengine from 'webappengine';
 import settings from './config/settings';
 import app from './app';
 import machineCore from './services/machine-core';
+import { ensureMachineCoreProcess } from './services/machine-core/process';
 import monitor from './services/monitor';
 import config from './services/configstore';
 import { ensureString } from './lib/ensure-type';
@@ -270,34 +271,41 @@ const createServer = (options, callback) => {
     });
 
     webappengine({ port, host, backlog, routes })
-        .on('ready', (server) => {
-            // cncengine service
-            machineCore.start(server, options.controller || config.get('controller', ''));
+        .on('ready', async (server) => {
+            try {
+                await ensureMachineCoreProcess();
 
-            const address = server.address().address;
-            const port = server.address().port;
+                // cncengine service
+                machineCore.start(server, options.controller || config.get('controller', ''));
 
-            callback && callback(null, {
-                address,
-                port,
-                mountPoints,
-            });
+                const address = server.address().address;
+                const port = server.address().port;
 
-            if (address !== '0.0.0.0') {
-                log.info('Starting the server at ' + chalk.yellow(`http://${address}:${port}`));
-                return;
-            }
+                callback && callback(null, {
+                    address,
+                    port,
+                    mountPoints,
+                });
 
-            dns.lookup(os.hostname(), { family: 4, all: true }, (err, addresses) => {
-                if (err) {
-                    log.error('Can\'t resolve host name:', err);
+                if (address !== '0.0.0.0') {
+                    log.info('Starting the server at ' + chalk.yellow(`http://${address}:${port}`));
                     return;
                 }
 
-                addresses.forEach(({ address, family }) => {
-                    log.info('Starting the server at ' + chalk.yellow(`http://${address}:${port}`));
+                dns.lookup(os.hostname(), { family: 4, all: true }, (err, addresses) => {
+                    if (err) {
+                        log.error('Can\'t resolve host name:', err);
+                        return;
+                    }
+
+                    addresses.forEach(({ address, family }) => {
+                        log.info('Starting the server at ' + chalk.yellow(`http://${address}:${port}`));
+                    });
                 });
-            });
+            } catch (err) {
+                log.error(err);
+                callback && callback(err);
+            }
         })
         .on('error', (err) => {
             log.error(err);
