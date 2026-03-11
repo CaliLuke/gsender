@@ -5,9 +5,8 @@ console.warn(chalk.yellow('Warning: The "cnc" executable is deprecated and will 
 
 const launchServer = (process.env.NODE_ENV === 'development')
     ? require('../output/server-cli')
-    : require('../dist/gsender/server-cli');
+    : require('../dist/gsender/server-cli.js');
 
 launchServer().catch(err => {
     console.error('Error:', err);
 });
-
